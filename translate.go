@@ -6,6 +6,7 @@
 package translate
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,15 @@ import (
 	"net/url"
 	"strings"
 )
+
+// Language represents a language supported by Google Translate.
+type Language struct {
+	Code        string
+	EnglishName string
+	Endonym     string
+}
+
+var cachedLangs []Language
 
 // Translate makes calls to Google Translate's reverse engineered web API to
 // translate text in sourceLang into targetLang reading from r and writing to w.
@@ -63,6 +73,114 @@ func TranslateString(input, sourceLang, targetLang string) (output string, err e
 		return "", err
 	}
 	return out.String(), nil
+}
+
+// Languages returns a list of languages supported by Google Translate.
+func Languages() ([]Language, error) {
+	if cachedLangs != nil {
+		return cachedLangs, nil
+	}
+	resp, err := http.Get("https://translate.google.com/")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	buf := bufio.NewReader(resp.Body)
+	delim := []byte(`[["auto","Detect language"]`)
+	cachedLangs = make([]Language, 0, 136)
+
+	if err := readUntil(buf, delim); err != nil {
+		return nil, fmt.Errorf("could not find list of languages: %w", err)
+	}
+	var langs [][2]string
+	if err := json.NewDecoder(io.MultiReader(bytes.NewReader(delim), buf)).Decode(&langs); err != nil {
+		return nil, err
+	}
+	io.Copy(ioutil.Discard, resp.Body)
+
+	// Add endonyms (Spanish -> Español)
+
+	resp, err = http.Get("https://ssl.gstatic.com/inputtools/js/ln/17/en.js")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	buf = bufio.NewReader(resp.Body)
+	if err := readUntil(buf, []byte(`window.LanguageDisplays.nativeNames = {`)); err != nil {
+		return nil, err
+	}
+	buf.UnreadByte()
+
+	endonyms := make(map[string]string, 128)
+	if err := json.NewDecoder(singleToDoubleQuoteReader{buf}).Decode(&endonyms); err != nil {
+		return nil, err
+	}
+	io.Copy(ioutil.Discard, resp.Body)
+
+	for _, lang := range langs {
+		cachedLangs = append(cachedLangs, Language{Code: lang[0], EnglishName: lang[1], Endonym: endonyms[lang[0]]})
+	}
+	return cachedLangs, nil
+}
+
+type singleToDoubleQuoteReader struct {
+	r io.Reader
+}
+
+func (r singleToDoubleQuoteReader) Read(p []byte) (n int, err error) {
+	n, err = r.r.Read(p)
+	p = p[:n]
+	for i, c := range p {
+		if c == '\'' {
+			p[i] = '"'
+		}
+	}
+	return n, err
+}
+
+// readUntil reads from reader until sep is found, discarding sep.
+func readUntil(buf *bufio.Reader, sep []byte) error {
+	if len(sep) == 0 {
+		return nil
+	}
+
+	firstPartMatched := false
+
+	// sep == sepPrefix + sepLastByte
+	sepLastByte := sep[len(sep)-1]
+	sepPrefix := sep[:len(sep)-1]
+
+	k := 0
+read:
+	for {
+		line, err := buf.ReadSlice(sepLastByte)
+		k += bytes.Count(line, []byte("\n"))
+		// if not found in this round
+		if err == bufio.ErrBufferFull {
+			// see if a substring of sepPrefix matches line
+			for i := range sepPrefix {
+				if bytes.Equal(line[len(line)-len(sepPrefix)+i:], sepPrefix[i:]) {
+					// part of sep was found
+					firstPartMatched = true
+					continue read
+				}
+			}
+			// sep not found in this round
+
+		} else if err != nil && err != io.EOF {
+			return err
+		} else if len(line) <= len(sep) {
+			// sep is longer than line, so we can potentially match
+			// the second part of a two-part sep.
+			if firstPartMatched && bytes.Equal(line, sep[len(sep)-len(line):]) {
+				return nil
+			}
+		} else if bytes.HasSuffix(line, sep) || err == io.EOF {
+			return nil
+		}
+		firstPartMatched = false
+	}
 }
 
 func translate(data []byte, sourceLang, targetLang string) ([]byte, error) {
